@@ -1309,6 +1309,12 @@ class CheckoutService:
                 # Clear cart after successful order
                 session.cart.clear()
                 
+
+                if session.user_id and session.user_id != "guestUser":
+                    from ..services.cart_service import get_cart_service
+                    cart_service = get_cart_service()
+                    await cart_service.silent_clear_cart_after_order(session.user_id, session.device_id)
+
                 return {
                     'success': True,
                     'message': f" Order confirmed successfully! Your order will be delivered to: {delivery_address}",

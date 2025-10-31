@@ -1043,7 +1043,34 @@ class CartService:
                 'raw_backend_data': None,
                 'source': 'local_fallback'
             }
-
+    async def silent_clear_cart_after_order(self, user_id: str, device_id: str) -> bool:
+        """
+        Silently clear cart after successful order confirmation.
+        No SSE events, no user notifications - just backend cleanup.
+        
+        Args:
+            user_id: User ID
+            device_id: Device ID
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            logger.info(f"[SILENT-CART-CLEAR] Starting silent cart clear for user={user_id}, device={device_id}")
+            
+            # Clear backend cart silently
+            result = await self.buyer_app.clear_cart(user_id, device_id)
+            
+            if result is None or result.get('error'):
+                logger.warning(f"[SILENT-CART-CLEAR] Backend clear failed: {result}")
+                return False
+            
+            logger.info(f"[SILENT-CART-CLEAR] Successfully cleared backend cart for user={user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"[SILENT-CART-CLEAR] Failed to clear cart: {e}")
+            return False
 
 # Singleton instance
 _cart_service: Optional[CartService] = None
