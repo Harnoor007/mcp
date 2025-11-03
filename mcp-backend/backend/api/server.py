@@ -27,6 +27,9 @@ from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_google import GoogleAugmentedLLM
 from mcp_agent.workflows.llm.augmented_llm import RequestParams
 
+from google import genai
+from google.genai import types
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,6 +71,49 @@ TOOL_EVENT_MAPPING = {
     # 'get_delivery_addresses': 'raw_addresses',
     # 'get_active_offers': 'raw_offers',
 }
+
+
+AGENT_INSTRUCTION="""You are an intelligent shopping assistant that takes decisive action and chains tools automatically to fulfill user requests.
+
+🚨 CRITICAL RULE: ALWAYS call the appropriate function for user requests!
+• "search X" → MUST call search_products(query="X")
+• "view cart" → MUST call view_cart()
+• "add Y" → MUST call search_products() then add_to_cart()
+• "checkout" or "proceed to checkout" → MUST call select_items_for_order()
+• NEVER provide generic responses - ALWAYS use the specific tool
+
+INTELLIGENT BEHAVIOR:
+• Auto-add items when searching for specific products
+• Choose best option based on price/quality
+• Chain tools: search → add → view_cart → inform user
+• Always execute the most relevant tool for each request
+• CALCULATE quantities automatically when context is given
+• ALWAYS call view_cart after add_to_cart to show updated cart state
+
+QUANTITY INTELLIGENCE:
+• "for X people" → Calculate appropriate quantities based on serving size
+• "for cooking/family" → Add standard cooking quantities 
+• "need X" without quantity → Add 1 unit as default
+• NEVER ask for quantity confirmation - be decisive and add!
+
+UNIVERSAL EXAMPLES:
+User: "search for [item]" → Call search_products(query="[item]")
+User: "view my cart" → Call view_cart()
+User: "i need [item]" → Call search_products(query="[item]") → Call add_to_cart(quantity=1) → Call view_cart()
+User: "[item] for X people" → Call search_products(query="[item]") → Call add_to_cart(quantity=[calculated]) → Call view_cart()
+User: "[item] for family" → Call search_products(query="[item]") → Call add_to_cart(quantity=[reasonable]) → Call view_cart()
+User: "checkout" → Call select_items_for_order() → initialize_order() → create_payment()
+
+Be proactive - calculate quantities intelligently, use tools, don't ask for confirmation!
+
+=== CHECKOUT AUTOMATION BOUNDARIES ===
+Checkout automation: select_items_for_order → initialize_order → create_payment (then wait)
+Payment processing: verify_payment and confirm_order require explicit user/frontend requests
+After create_payment: Wait for manual payment verification before continuing"""
+# Caching
+instruction_cache = None  # Store cache reference globally
+cache_creation_time = None
+CACHE_TTL_SECONDS = 3600  # 1 hour cache lifetime
 
 def create_sse_event(tool_name, raw_data, session_id):
     """Create universal SSE event based on tool type using DRY pattern"""
@@ -215,6 +261,49 @@ def determine_context_type(tool_result: Dict[str, Any]) -> tuple[str, bool]:
     
     return None, False
 
+async def get_or_create_instruction_cache():
+    """Create or return existing instruction cache"""
+    global instruction_cache, cache_creation_time
+    
+    # Check if cache exists and is not expired
+    if instruction_cache and cache_creation_time:
+        elapsed = time.time() - cache_creation_time
+        if elapsed < CACHE_TTL_SECONDS - 60:  # Refresh 60s before expiry
+            logger.info(f"Using existing cache, age: {elapsed:.0f}s")
+            return instruction_cache
+    
+    # Create new cache
+    logger.info("Creating new instruction cache...")
+    
+    try:
+        # Initialize Gemini client
+        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+        # Create cache with system instruction
+        # NOTE: Gemini requires versioned model for caching 
+        cache = gemini_client.caches.create(
+            model="models/gemini-2.5-flash-001",
+            config=types.CreateCachedContentConfig(
+                display_name="shopping_assistant_instruction",
+                system_instruction=AGENT_INSTRUCTION,
+                ttl=f"{CACHE_TTL_SECONDS}s"
+            )
+        )
+        
+        instruction_cache = cache
+        cache_creation_time = time.time()
+        
+        logger.info(f"✓ Cache created successfully: {cache.name}")
+        logger.info(f"Cache expires in {CACHE_TTL_SECONDS}s")
+        
+        return instruction_cache
+        
+    except Exception as e:
+        logger.error(f"Failed to create cache: {e}")
+        logger.info("Falling back to non-cached mode")
+        return None
+                  
+
 async def get_session_llm(session_id: str):
     """Get or create a session-specific LLM with conversation history"""
     logger.info(f"[LLM-LIFECYCLE] Getting LLM for session: {session_id}")
@@ -223,12 +312,25 @@ async def get_session_llm(session_id: str):
     if session_id not in session_llms:
         if not agent:
             raise HTTPException(status_code=503, detail="Agent not ready")
+         # Try to use cache first
+        cache = await get_or_create_instruction_cache()
         
-        # Create a new LLM instance for this session
-        session_llm = await agent.attach_llm(GoogleAugmentedLLM)
+        if cache:
+            # WITH CACHE: Use cached_content (token savings)
+            session_llm = await agent.attach_llm(
+                GoogleAugmentedLLM,
+                cached_content=cache.name
+            )
+            logger.info(f"Session {session_id} using CACHED instruction (75-90% savings)")
+        else:
+            # Create a new LLM instance for this session
+            session_llm = await agent.attach_llm(GoogleAugmentedLLM)
+            logger.info(f"Session {session_id} using NON-CACHED mode")
+            
         session_llms[session_id] = session_llm
         logger.info(f"[LLM-LIFECYCLE] Created NEW session LLM for session: {session_id}")
         logger.info(f"[LLM-LIFECYCLE] session_llms now has {len(session_llms)} entries")
+
     else:
         logger.info(f"[LLM-LIFECYCLE] Reusing EXISTING session LLM for session: {session_id}")
     
@@ -253,43 +355,7 @@ async def lifespan(app: FastAPI):
             # Create agent connected to MCP server via STDIO
             agent = Agent(
                 name="shopping_assistant",
-                instruction="""You are an intelligent shopping assistant that takes decisive action and chains tools automatically to fulfill user requests.
-
-🚨 CRITICAL RULE: ALWAYS call the appropriate function for user requests!
-• "search X" → MUST call search_products(query="X")
-• "view cart" → MUST call view_cart()
-• "add Y" → MUST call search_products() then add_to_cart()
-• "checkout" or "proceed to checkout" → MUST call select_items_for_order()
-• NEVER provide generic responses - ALWAYS use the specific tool
-
-INTELLIGENT BEHAVIOR:
-• Auto-add items when searching for specific products
-• Choose best option based on price/quality
-• Chain tools: search → add → view_cart → inform user
-• Always execute the most relevant tool for each request
-• CALCULATE quantities automatically when context is given
-• ALWAYS call view_cart after add_to_cart to show updated cart state
-
-QUANTITY INTELLIGENCE:
-• "for X people" → Calculate appropriate quantities based on serving size
-• "for cooking/family" → Add standard cooking quantities 
-• "need X" without quantity → Add 1 unit as default
-• NEVER ask for quantity confirmation - be decisive and add!
-
-UNIVERSAL EXAMPLES:
-User: "search for [item]" → Call search_products(query="[item]")
-User: "view my cart" → Call view_cart()
-User: "i need [item]" → Call search_products(query="[item]") → Call add_to_cart(quantity=1) → Call view_cart()
-User: "[item] for X people" → Call search_products(query="[item]") → Call add_to_cart(quantity=[calculated]) → Call view_cart()
-User: "[item] for family" → Call search_products(query="[item]") → Call add_to_cart(quantity=[reasonable]) → Call view_cart()
-User: "checkout" → Call select_items_for_order() → initialize_order() → create_payment()
-
-Be proactive - calculate quantities intelligently, use tools, don't ask for confirmation!
-
-=== CHECKOUT AUTOMATION BOUNDARIES ===
-Checkout automation: select_items_for_order → initialize_order → create_payment (then wait)
-Payment processing: verify_payment and confirm_order require explicit user/frontend requests
-After create_payment: Wait for manual payment verification before continuing""",
+                instruction=AGENT_INSTRUCTION,
                 server_names=["ondc-shopping"]  # Connects to our MCP server
             )
             
@@ -446,6 +512,32 @@ async def health_check(request: Request):
         "timestamp": datetime.now(),
         "agent_ready": llm is not None,
         "active_sessions": len(sessions)
+    }
+
+@app.get("/api/cache/status")
+async def cache_status():
+    """Check cache status and savings"""
+    if not instruction_cache:
+        return {
+            "cached": False, 
+            "message": "No active cache",
+            "fallback_mode": "Using direct instruction mode"
+        }
+    
+    elapsed = time.time() - cache_creation_time if cache_creation_time else 0
+    remaining = CACHE_TTL_SECONDS - elapsed
+    
+    return {
+        "cached": True,
+        "cache_name": instruction_cache.name,
+        "age_seconds": int(elapsed),
+        "remaining_seconds": int(remaining),
+        "expires_at": datetime.fromtimestamp(cache_creation_time + CACHE_TTL_SECONDS).isoformat(),
+        "active_sessions": len(session_llms),
+        "total_sessions": len(sessions),
+        "estimated_savings": "75-90% on input tokens",
+        "cache_ttl": CACHE_TTL_SECONDS,
+        "model": "gemini-2.5-flash"
     }
 
 # Session management
