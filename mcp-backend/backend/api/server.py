@@ -27,6 +27,11 @@ from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_google import GoogleAugmentedLLM
 from mcp_agent.workflows.llm.augmented_llm import RequestParams
 
+from collections import OrderedDict
+from datetime import timedelta
+import asyncio
+from typing import Optional
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,9 +43,7 @@ limiter = Limiter(key_func=get_remote_address)
 mcp_app = None
 agent = None
 llm = None
-sessions = {}  # In-memory session storage (use Redis/MongoDB in production)
-session_llms = {}  # Session-specific LLM instances with conversation history
-raw_data_queues = {}  # Session-specific queues for raw data from MCP callbacks
+session_manager = None
 
 # ============================================================================
 # Universal SSE Data Transmission System
@@ -161,21 +164,26 @@ def generate_session_id() -> str:
     """Generate a unique session ID."""
     return f"session_{uuid.uuid4().hex}"
 
-def create_or_update_session(session_id: str, device_id: str, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Create a new session or update existing one."""
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "session_id": session_id,
-            "device_id": device_id,
-            "created_at": datetime.now(),
-            "last_activity": datetime.now(),
-            "metadata": metadata or {}
-        }
-    else:
-        sessions[session_id]["last_activity"] = datetime.now()
-        if metadata:
-            sessions[session_id]["metadata"].update(metadata)
-    return sessions[session_id]
+# def create_or_update_session(session_id: str, device_id: str, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+#     """Create a new session or update existing one."""
+#     if session_id not in sessions:
+#         sessions[session_id] = {
+#             "session_id": session_id,
+#             "device_id": device_id,
+#             "created_at": datetime.now(),
+#             "last_activity": datetime.now(),
+#             "metadata": metadata or {}
+#         }
+#     else:
+#         sessions[session_id]["last_activity"] = datetime.now()
+#         if metadata:
+#             sessions[session_id]["metadata"].update(metadata)
+#     return sessions[session_id]
+
+async def create_or_update_session(session_id: str, device_id: str, 
+                                   metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Thread-safe session creation/update"""
+    return await session_manager.create_or_update(session_id, device_id, metadata)
 
 def check_agent_ready():
     """Check if agent is ready and raise appropriate error."""
@@ -215,24 +223,281 @@ def determine_context_type(tool_result: Dict[str, Any]) -> tuple[str, bool]:
     
     return None, False
 
-async def get_session_llm(session_id: str):
-    """Get or create a session-specific LLM with conversation history"""
-    logger.info(f"[LLM-LIFECYCLE] Getting LLM for session: {session_id}")
-    logger.info(f"[LLM-LIFECYCLE] Current session_llms keys: {list(session_llms.keys())}")
+# async def get_session_llm(session_id: str):
+#     """Get or create a session-specific LLM with conversation history"""
+#     logger.info(f"[LLM-LIFECYCLE] Getting LLM for session: {session_id}")
+#     logger.info(f"[LLM-LIFECYCLE] Current session_llms keys: {list(session_llms.keys())}")
     
-    if session_id not in session_llms:
-        if not agent:
-            raise HTTPException(status_code=503, detail="Agent not ready")
+#     if session_id not in session_llms:
+#         if not agent:
+#             raise HTTPException(status_code=503, detail="Agent not ready")
         
-        # Create a new LLM instance for this session
-        session_llm = await agent.attach_llm(GoogleAugmentedLLM)
-        session_llms[session_id] = session_llm
-        logger.info(f"[LLM-LIFECYCLE] Created NEW session LLM for session: {session_id}")
-        logger.info(f"[LLM-LIFECYCLE] session_llms now has {len(session_llms)} entries")
-    else:
-        logger.info(f"[LLM-LIFECYCLE] Reusing EXISTING session LLM for session: {session_id}")
+#         # Create a new LLM instance for this session
+#         session_llm = await agent.attach_llm(GoogleAugmentedLLM)
+#         session_llms[session_id] = session_llm
+#         logger.info(f"[LLM-LIFECYCLE] Created NEW session LLM for session: {session_id}")
+#         logger.info(f"[LLM-LIFECYCLE] session_llms now has {len(session_llms)} entries")
+#     else:
+#         logger.info(f"[LLM-LIFECYCLE] Reusing EXISTING session LLM for session: {session_id}")
     
-    return session_llms[session_id]
+#     return session_llms[session_id]
+
+async def get_session_llm(session_id: str):
+    """Thread-safe LLM retrieval/creation"""
+    return await session_manager.get_or_create_llm(session_id, agent)
+
+class SessionManager:
+    """Thread-safe session manager with automatic cleanup"""
+    
+    def __init__(self, max_sessions: int = 1000, ttl_hours: int = 24):
+        # Thread-safe storage with OrderedDict for LRU
+        self.sessions = OrderedDict()
+        self.session_llms = {}
+        self.raw_data_queues = {}
+        
+        # Locks for thread safety
+        self._global_lock = asyncio.Lock()
+        self._session_locks: Dict[str, asyncio.Lock] = {}
+        
+        # Configuration
+        self.max_sessions = max_sessions
+        self.ttl = timedelta(hours=ttl_hours)
+        
+        # Metrics
+        self.metrics = {
+            'total_created': 0,
+            'total_evicted': 0,
+            'total_expired': 0,
+            'total_deleted': 0
+        }
+        
+        # Cleanup task
+        self._cleanup_task = None
+    
+    async def start_cleanup_scheduler(self):
+        """Start background cleanup task"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+            logger.info("[SESSION-MANAGER] Started cleanup scheduler")
+    
+    async def _periodic_cleanup(self):
+        """Periodic cleanup of expired sessions"""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # Every hour
+                cleaned = await self.cleanup_expired()
+                if cleaned > 0:
+                    logger.info(f"[SESSION-MANAGER] Cleaned {cleaned} expired sessions")
+            except asyncio.CancelledError:
+                logger.info("[SESSION-MANAGER] Cleanup scheduler stopped")
+                break
+            except Exception as e:
+                logger.error(f"[SESSION-MANAGER] Cleanup error: {e}")
+    
+    async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create lock for specific session"""
+        async with self._global_lock:
+            if session_id not in self._session_locks:
+                self._session_locks[session_id] = asyncio.Lock()
+            return self._session_locks[session_id]
+    
+    async def create_or_update(self, session_id: str, device_id: str, 
+                               metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Thread-safe session creation/update"""
+        
+        lock = await self._get_session_lock(session_id)
+        
+        async with lock:
+            # Check if we need to evict old sessions
+            await self._enforce_limits()
+            
+            if session_id not in self.sessions:
+                # Create new session
+                session = {
+                    "session_id": session_id,
+                    "device_id": device_id,
+                    "created_at": datetime.now(),
+                    "last_activity": datetime.now(),
+                    "metadata": metadata or {}
+                }
+                self.sessions[session_id] = session
+                self.metrics['total_created'] += 1
+                logger.info(f"[SESSION-MANAGER] Created session: {session_id}")
+            else:
+                # Update existing session
+                session = self.sessions[session_id]
+                session["last_activity"] = datetime.now()
+                if metadata:
+                    session["metadata"].update(metadata)
+                
+                # Move to end (LRU)
+                self.sessions.move_to_end(session_id)
+            
+            return self.sessions[session_id]
+    
+    async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Thread-safe session retrieval"""
+        
+        lock = await self._get_session_lock(session_id)
+        
+        async with lock:
+            if session_id not in self.sessions:
+                return None
+            
+            session = self.sessions[session_id]
+            
+            # Check if expired
+            if datetime.now() - session['last_activity'] > self.ttl:
+                logger.info(f"[SESSION-MANAGER] Session {session_id} expired")
+                await self._delete_internal(session_id)
+                return None
+            
+            # Update activity and move to end (LRU)
+            session['last_activity'] = datetime.now()
+            self.sessions.move_to_end(session_id)
+            
+            return session
+    
+    async def delete(self, session_id: str) -> bool:
+        """Thread-safe session deletion"""
+        
+        lock = await self._get_session_lock(session_id)
+        
+        async with lock:
+            if session_id not in self.sessions:
+                return False
+            
+            await self._delete_internal(session_id)
+            self.metrics['total_deleted'] += 1
+            logger.info(f"[SESSION-MANAGER] Deleted session: {session_id}")
+            
+            return True
+    
+    async def _delete_internal(self, session_id: str):
+        """Internal delete without acquiring lock (called from locked context)"""
+        
+        # Remove session
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+        
+        # Cleanup LLM instance
+        if session_id in self.session_llms:
+            del self.session_llms[session_id]
+            logger.debug(f"[SESSION-MANAGER] Cleaned LLM for {session_id}")
+        
+        # Cleanup queue
+        if session_id in self.raw_data_queues:
+            queue = self.raw_data_queues[session_id]
+            # Drain queue
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except:
+                    break
+            del self.raw_data_queues[session_id]
+            logger.debug(f"[SESSION-MANAGER] Cleaned queue for {session_id}")
+        
+        # Cleanup lock
+        if session_id in self._session_locks:
+            del self._session_locks[session_id]
+    
+    async def _enforce_limits(self):
+        """Enforce max session limit with LRU eviction"""
+        
+        if len(self.sessions) >= self.max_sessions:
+            # Evict oldest session
+            oldest_id, _ = self.sessions.popitem(last=False)
+            await self._delete_internal(oldest_id)
+            self.metrics['total_evicted'] += 1
+            logger.warning(f"[SESSION-MANAGER] Evicted session {oldest_id} (max limit reached)")
+    
+    async def cleanup_expired(self) -> int:
+        """Cleanup expired sessions"""
+        
+        cleaned = 0
+        current_time = datetime.now()
+        
+        # Get list of expired sessions
+        async with self._global_lock:
+            expired_ids = [
+                sid for sid, session in self.sessions.items()
+                if current_time - session['last_activity'] > self.ttl
+            ]
+        
+        # Delete expired sessions
+        for session_id in expired_ids:
+            if await self.delete(session_id):
+                cleaned += 1
+                self.metrics['total_expired'] += 1
+        
+        return cleaned
+    
+    async def get_or_create_llm(self, session_id: str, agent) -> Any:
+        """Thread-safe LLM retrieval/creation"""
+        
+        lock = await self._get_session_lock(session_id)
+        
+        async with lock:
+            if session_id not in self.session_llms:
+                if not agent:
+                    raise HTTPException(status_code=503, detail="Agent not ready")
+                
+                session_llm = await agent.attach_llm(GoogleAugmentedLLM)
+                self.session_llms[session_id] = session_llm
+                logger.info(f"[SESSION-MANAGER] Created LLM for session: {session_id}")
+            else:
+                logger.debug(f"[SESSION-MANAGER] Reusing LLM for session: {session_id}")
+            
+            return self.session_llms[session_id]
+    
+    async def create_queue(self, session_id: str) -> asyncio.Queue:
+        """Thread-safe queue creation"""
+        
+        lock = await self._get_session_lock(session_id)
+        
+        async with lock:
+            if session_id not in self.raw_data_queues:
+                self.raw_data_queues[session_id] = asyncio.Queue()
+                logger.info(f"[SESSION-MANAGER] Created queue for session: {session_id}")
+            
+            return self.raw_data_queues[session_id]
+    
+    async def get_queue(self, session_id: str) -> Optional[asyncio.Queue]:
+        """Thread-safe queue retrieval"""
+        
+        lock = await self._get_session_lock(session_id)
+        
+        async with lock:
+            return self.raw_data_queues.get(session_id)
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get session manager metrics"""
+        return {
+            **self.metrics,
+            'active_sessions': len(self.sessions),
+            'active_llms': len(self.session_llms),
+            'active_queues': len(self.raw_data_queues),
+            'max_sessions': self.max_sessions,
+            'ttl_hours': self.ttl.total_seconds() / 3600
+        }
+    
+    async def shutdown(self):
+        """Cleanup on shutdown"""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info("[SESSION-MANAGER] Shutdown complete")
+
+# Initialize thread-safe session manager
+session_manager = SessionManager(
+    max_sessions=int(os.getenv("MAX_SESSIONS", "1000")),
+    ttl_hours=int(os.getenv("SESSION_TTL_HOURS", "24"))
+)
+logger.info("[SESSION-MANAGER] Initialized global session manager")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -297,6 +562,8 @@ After create_payment: Wait for manual payment verification before continuing""",
             
             # Attach Gemini LLM
             llm = await agent.attach_llm(GoogleAugmentedLLM)
+
+            await session_manager.start_cleanup_scheduler()
             
             logger.info("✅ Backend API ready with MCP-Agent!")
             
@@ -368,8 +635,9 @@ async def receive_tool_result(tool_data: dict):
     
     logger.info(f"[RAW-DATA] Received {tool_name} data for session {session_id}")
     
+    queue = await session_manager.get_queue(session_id)
     # Send raw data to active SSE streams via queue using universal system
-    if session_id and session_id in raw_data_queues:
+    if queue:
         try:
             # Check if tool has any raw data to transmit
             has_data = False
@@ -383,7 +651,7 @@ async def receive_tool_result(tool_data: dict):
                 raw_event = create_sse_event(tool_name, raw_data, session_id)
                 
                 # Put raw data into the session's queue for SSE streaming
-                await raw_data_queues[session_id].put(raw_event)
+                await queue.put(raw_event)
                 
                 # Log with appropriate message
                 log_message = get_log_message(tool_name, raw_data)
@@ -409,8 +677,9 @@ async def receive_tool_event(event_data: dict):
     
     logger.debug(f"[TOOL-EVENT] {event_type} for {tool_name} in session {session_id}")
     
+    queue = await session_manager.get_queue(session_id)
     # Send tool event to active SSE streams
-    if session_id and session_id in raw_data_queues:
+    if queue:
         try:
             # Create tool execution event
             tool_event = {
@@ -427,7 +696,7 @@ async def receive_tool_event(event_data: dict):
             }
             
             # Put tool event into the session's queue for SSE streaming
-            await raw_data_queues[session_id].put(tool_event)
+            await queue.put(tool_event)
             
             logger.debug(f"[TOOL-EVENT] Queued {event_type} event for {tool_name} in session {session_id}")
             
@@ -445,8 +714,13 @@ async def health_check(request: Request):
         "status": "healthy" if llm else "initializing",
         "timestamp": datetime.now(),
         "agent_ready": llm is not None,
-        "active_sessions": len(sessions)
+        "active_sessions": len(session_manager.sessions)
     }
+
+@app.get("/api/metrics/sessions")
+async def session_metrics():
+    """Get session manager metrics"""
+    return session_manager.get_metrics()
 
 # Session management
 @app.post("/api/v1/sessions", response_model=SessionResponse)
@@ -456,7 +730,10 @@ async def create_session(request: Request, session_req: SessionCreateRequest):
     session_id = generate_session_id()
     device_id = session_req.device_id or generate_device_id()
     
-    session = create_or_update_session(session_id, device_id, session_req.metadata)
+    # Thread-safe creation
+    session = await session_manager.create_or_update(
+        session_id, device_id, session_req.metadata
+    )
     logger.info(f"Created session: {session_id}")
     
     return SessionResponse(**session)
@@ -465,22 +742,21 @@ async def create_session(request: Request, session_req: SessionCreateRequest):
 @limiter.limit("30/minute")
 async def get_session(request: Request, session_id: str):
     """Get session information"""
-    if session_id not in sessions:
+    session = await session_manager.get(session_id)
+    
+    if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    return SessionResponse(**sessions[session_id])
+    return SessionResponse(**session)
 
 @app.delete("/api/v1/sessions/{session_id}")
 @limiter.limit("20/minute")
 async def delete_session(request: Request, session_id: str):
     """End a shopping session"""
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+    success = await session_manager.delete(session_id)
     
-    # Clean up session data and LLM
-    del sessions[session_id]
-    if session_id in session_llms:
-        del session_llms[session_id]
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found")
     
     logger.info(f"Deleted session and LLM: {session_id}")
     
@@ -625,7 +901,7 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
     session_id = chat_req.session_id or generate_session_id()
     
     # Create or update session - same session management as regular chat
-    create_or_update_session(session_id, device_id)
+    await create_or_update_session(session_id, device_id)
     
     async def robust_event_stream():
         
@@ -634,7 +910,7 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
         start_time = time.time()
         
         # Create asyncio queue for this session to receive raw data from MCP callbacks
-        raw_data_queues[session_id] = asyncio.Queue()
+        await session_manager.create_queue(session_id)
         logger.info(f"[SSE-RAW] Created raw data queue for session {session_id}")
         
         try:
@@ -690,8 +966,8 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
             
             while not generation_task.done():
                 # Check for tool events in real-time
-                if session_id in raw_data_queues:
-                    queue = raw_data_queues[session_id]
+                queue = await session_manager.get_queue(session_id)
+                if queue:
                     try:
                         # Short timeout to keep checking generation status
                         raw_event = await asyncio.wait_for(queue.get(), timeout=0.1)
@@ -796,8 +1072,8 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
             
             # Process any remaining events in queue after generation completes
             final_events_processed = 0
-            if session_id in raw_data_queues:
-                queue = raw_data_queues[session_id]
+            queue = await session_manager.get_queue(session_id)  # ✅ NEW CODE
+            if queue:
                 while not queue.empty():
                     try:
                         raw_event = await asyncio.wait_for(queue.get(), timeout=0.1)
@@ -871,9 +1147,8 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
         
         finally:
             # Clean up raw data queue for this session
-            if session_id in raw_data_queues:
-                del raw_data_queues[session_id]
-                logger.info(f"[SSE-RAW] Cleaned up raw data queue for session {session_id}")
+            # Queue cleanup now handled by session_manager.delete()
+            logger.info(f"[SSE-RAW] Queue cleanup handled by session manager")
             
             # Connection cleanup if needed
             if time.time() - start_time > connection_timeout:
@@ -961,7 +1236,7 @@ async def root():
             "cart": "/api/v1/cart/{device_id}"
         },
         "docs": "/docs",
-        "active_sessions": len(sessions)
+        "active_sessions": len(session_manager.sessions)
     }
 
 if __name__ == "__main__":
