@@ -76,7 +76,28 @@ async def search_products(session_id: Optional[str] = None, query: str = '',
             if item_data:
                 # Apply field mapping for MCP compatibility
                 mcp_item = enhance_for_mcp(item_data)
-                products.append(mcp_item)
+
+                item_details = mcp_item.get("item_details", {})
+                descriptor = item_details.get("descriptor", {})
+                price = item_details.get("price", {})
+                quantity = item_details.get("quantity", {})
+                available = quantity.get("available", {})
+                provider_details = mcp_item.get("provider_details", {})
+                provider_descriptor = provider_details.get("descriptor", {})
+                
+                # Filter for essential fields
+                filtered_item = {
+                    "id": item_details.get("id"),
+                    "name": descriptor.get("name"),
+                    "description": descriptor.get("short_desc"),
+                    "price": price.get("value"),
+                    "currency": price.get("currency"),
+                    "available_quantity": available.get("count"),
+                    "image_url": descriptor.get("symbol"),
+                    "provider_name": provider_descriptor.get("name"),
+                    "category_name": item_details.get("category_id"),
+                }
+                products.append(filtered_item)
         
         # Update session history with product results for context
         session_obj.search_history.append({

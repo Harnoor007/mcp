@@ -379,8 +379,10 @@ async def handle_tool_execution(tool_name: str, adapter_func, ctx: Context, **kw
         
         # Return formatted result (JSON strings for mcp-agent compatibility)
         if isinstance(result, dict):
+            logger.info(f"[AGENT-RESPONSE] {json.dumps(result, indent=2, default=str)}")  
             return json.dumps(result, indent=2, default=str)
         else:
+            logger.info(f"[AGENT-RESPONSE] {str(result)}") 
             return str(result)
             
     except Exception as e:
