@@ -356,11 +356,8 @@ class CheckoutService:
                 select_item = {
                     'id': item.id,                   # Full ONDC ID
                     'local_id': item.local_id,       # UUID local ID
-                    'quantity': {'count': item.quantity},  # Wrapped in count object
-                    'customisationState': {},        # Required by Postman format
-                    'customisations': None,          # Required by Postman format
-                    'hasCustomisations': False       # Required by Postman format
-                }
+                    'quantity': {'count': item.quantity},  
+                    }
                 
                 # Add product structure for biap backend compatibility
                 if item.location_id:
@@ -393,23 +390,13 @@ class CheckoutService:
             
             # Create provider at cart level using utility
             cart_provider = create_provider_for_context(
-                provider_info, 
+                provider_info,
                 context="cart"
             ) if provider_info else None
-            
-            cart_obj = {
-                'items': select_items  # Items have provider at item level
-            }
-            
-            # Add provider at cart level if available (for backend transformation)
-            if cart_provider:
-                cart_obj['provider'] = cart_provider
-                logger.debug(f"[CheckoutService] Cart provider: {json.dumps(cart_provider, indent=2)}")
-            
+
             # Get GPS coordinates using centralized utility
             gps_coords = get_city_gps(delivery_city)
             logger.debug(f"[CheckoutService] GPS coordinates for {delivery_city}: {gps_coords}")
-            
             #  CRITICAL: Simplify fulfillments to match Postman collection exactly
             fulfillments_obj = [{
                 'end': {
@@ -421,17 +408,32 @@ class CheckoutService:
                     }
                 }
             }]
-            
-            select_data = {
-                'context': context,
-                'message': {
-                    'cart': cart_obj,             #  Backend expects 'cart' (confirmed from Postman collection)
-                    'fulfillments': fulfillments_obj  #  At message level as backend expects
-                },
-                'userId': session.session_id,
-                'deviceId': getattr(session, 'device_id', config.guest.device_id)
+
+            # Per API error, structure the message with an 'order' object instead of 'cart'
+            order_payload = {
+                'items': select_items,
+                'provider': cart_provider,
+                'fulfillments': fulfillments_obj
             }
-            
+
+            select_data = _compact_dict({
+                    "context": context,
+                    "message": {
+                        "cart": {   # revert to cart unless BIAP explicitly expects 'order'
+                             "items": select_items,
+                            "provider": cart_provider
+                            },
+                        "fulfillments": fulfillments_obj
+                        },
+                    "userId": session.session_id,
+                    "deviceId": getattr(session, 'device_id', config.guest.device_id)
+})
+
+            select_data = _compact_dict(select_data)
+            logger.info(f"[CheckoutService] SELECT request payload: {_safe_json(select_data)}")
+            auth_token = getattr(session, 'auth_token', None)
+            select_response = await self.buyer_app.select_items(select_data, auth_token=auth_token)
+
             logger.info("[CheckoutService] Step 9: Calling BIAP SELECT API...")
             # Enhanced debug logging for SELECT request
             logger.info(f"[CheckoutService] SELECT request summary:")
@@ -484,7 +486,8 @@ class CheckoutService:
             else:
                 logger.warning(f"[CheckoutService] No provider locations found in cart_provider: {cart_provider}")
             
-            logger.debug(f"[CheckoutService] Full SELECT request payload:\n{json.dumps(select_data, indent=2)}")
+            logger.debug(f"[CheckoutService] Context created: {_safe_json(context)}")
+            logger.debug(f"[CheckoutService] Full SELECT request payload: {str(_safe_json(select_data))}")
             
             # GUEST MODE: SELECT API call without authentication
             auth_token = getattr(session, 'auth_token', None)
@@ -1436,3 +1439,17 @@ def get_checkout_service() -> CheckoutService:
     if _checkout_service is None:
         _checkout_service = CheckoutService()
     return _checkout_service
+def _safe_json(data, max_length=4000):
+    try:
+        s = json.dumps(data, ensure_ascii=False, default=str)
+        return s[:max_length] + (' ...[truncated]' if len(s) > max_length else '')
+    except Exception as e:
+        return f"<unserializable: {e}>"
+
+def _compact_dict(d):
+    """Recursively remove None, empty dicts/lists/strings."""
+    if isinstance(d, dict):
+        return {k: _compact_dict(v) for k, v in d.items() if v not in (None, {}, [], '')}
+    elif isinstance(d, list):
+        return [_compact_dict(v) for v in d if v not in (None, {}, [], '')]
+    return d
