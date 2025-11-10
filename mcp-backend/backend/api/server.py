@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
+import redis
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,17 +38,70 @@ logger = logging.getLogger(__name__)
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
+# Redis Session Manager
+class RedisSessionManager:
+    def __init__(self, host='localhost', port=6379, db=1):
+        try:
+            self.client = redis.Redis(host=host, port=port, db=db, decode_responses=True)
+            self.client.ping()
+            logger.info("Connected to Redis for session management. main server")
+        except redis.exceptions.ConnectionError as e:
+            logger.info(f"Could not connect to Redis: {e}. Sessions will not be persisted.")
+            logger.error(f"Could not connect to Redis: {e}. Sessions will not be persisted.")
+            self.client = None
+
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        if not self.client:
+            return None
+        session_data = self.client.get(f"session:{session_id}")
+        if session_data:
+            session_dict = json.loads(session_data)
+            if 'created_at' in session_dict:
+                if isinstance(session_dict['created_at'], str):
+                    session_dict['created_at'] = datetime.fromisoformat(session_dict['created_at'])
+            if 'last_activity' in session_dict:
+                if isinstance(session_dict['last_activity'], str):
+                    session_dict['last_activity'] = datetime.fromisoformat(session_dict['last_activity'])
+            return session_dict
+        return None
+
+    def set_session(self, session_id: str, session_data: Dict[str, Any]):
+        if not self.client:
+            return
+        # Convert datetime objects to isoformat strings for JSON serialization
+        session_copy = session_data.copy()
+        if 'created_at' in session_copy and isinstance(session_copy['created_at'], datetime):
+            session_copy['created_at'] = session_copy['created_at'].isoformat()
+        if 'last_activity' in session_copy and isinstance(session_copy['last_activity'], datetime):
+            session_copy['last_activity'] = session_copy['last_activity'].isoformat()
+        self.client.set(f"session:{session_id}", json.dumps(session_copy), ex=86400)  # 24-hour TTL
+
+    def delete_session(self, session_id: str):
+        if not self.client:
+            return
+        self.client.delete(f"session:{session_id}")
+
+    def exists_session(self, session_id: str) -> bool:
+        if not self.client:
+            return False
+        return self.client.exists(f"session:{session_id}") > 0
+
+    def count_session(self) -> int:
+        if not self.client:
+            return 0
+        return len(self.client.keys("session:*"))
+
 # Global instances
 mcp_app = None
 agent = None
 llm = None
-sessions = {}  # In-memory session storage (use Redis/MongoDB in production)
+sessions = RedisSessionManager(host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", 6379)), db = int(os.getenv("REDIS_DB_BACKEND", 1)))
 session_llms = {}  # Session-specific LLM instances with conversation history
 raw_data_queues = {}  # Session-specific queues for raw data from MCP callbacks
 
-# ============================================================================
+# ============================================================================ 
 # Universal SSE Data Transmission System
-# ============================================================================
+# ============================================================================ 
 
 # Tool to event type mapping for SSE streaming
 TOOL_EVENT_MAPPING = {
@@ -209,19 +263,22 @@ def generate_session_id() -> str:
 
 def create_or_update_session(session_id: str, device_id: str, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
     """Create a new session or update existing one."""
-    if session_id not in sessions:
-        sessions[session_id] = {
+    if not sessions.exists_session(session_id):
+        session_data = {
             "session_id": session_id,
             "device_id": device_id,
             "created_at": datetime.now(),
             "last_activity": datetime.now(),
             "metadata": metadata or {}
         }
+        sessions.set_session(session_id, session_data)
     else:
-        sessions[session_id]["last_activity"] = datetime.now()
+        session_data = sessions.get_session(session_id)
+        session_data["last_activity"] = datetime.now()
         if metadata:
-            sessions[session_id]["metadata"].update(metadata)
-    return sessions[session_id]
+            session_data["metadata"].update(metadata)
+        sessions.set_session(session_id, session_data)
+    return sessions.get_session(session_id)
 
 def check_agent_ready():
     """Check if agent is ready and raise appropriate error."""
@@ -511,7 +568,7 @@ async def health_check(request: Request):
         "status": "healthy" if llm else "initializing",
         "timestamp": datetime.now(),
         "agent_ready": llm is not None,
-        "active_sessions": len(sessions)
+        "active_sessions": sessions.count_session()
     }
 
 @app.get("/api/cache/status")
@@ -534,7 +591,7 @@ async def cache_status():
         "remaining_seconds": int(remaining),
         "expires_at": datetime.fromtimestamp(cache_creation_time + CACHE_TTL_SECONDS).isoformat(),
         "active_sessions": len(session_llms),
-        "total_sessions": len(sessions),
+        "total_sessions": sessions.count_session(),
         "estimated_savings": "75-90% on input tokens",
         "cache_ttl": CACHE_TTL_SECONDS,
         "model": "gemini-2.5-flash"
@@ -557,20 +614,21 @@ async def create_session(request: Request, session_req: SessionCreateRequest):
 @limiter.limit("30/minute")
 async def get_session(request: Request, session_id: str):
     """Get session information"""
-    if session_id not in sessions:
+    session_data = sessions.get_session(session_id)
+    if not session_data:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    return SessionResponse(**sessions[session_id])
+    return SessionResponse(**session_data)
 
 @app.delete("/api/v1/sessions/{session_id}")
 @limiter.limit("20/minute")
 async def delete_session(request: Request, session_id: str):
     """End a shopping session"""
-    if session_id not in sessions:
+    if not sessions.exists_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     
     # Clean up session data and LLM
-    del sessions[session_id]
+    sessions.delete_session(session_id)
     if session_id in session_llms:
         del session_llms[session_id]
     
@@ -1053,7 +1111,7 @@ async def root():
             "cart": "/api/v1/cart/{device_id}"
         },
         "docs": "/docs",
-        "active_sessions": len(sessions)
+        "active_sessions": sessions.count_session()
     }
 
 if __name__ == "__main__":

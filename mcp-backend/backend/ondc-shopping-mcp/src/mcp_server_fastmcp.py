@@ -83,6 +83,7 @@ from .adapters.utils import (
     get_services,
     send_raw_data_to_frontend
 )
+from src.redis_service import get_redis_client, get_redis_client_persistence
 
 # Import all tool adapters
 from .adapters.cart import (
@@ -1059,6 +1060,8 @@ def main():
         logger.info("🚀 Starting FastMCP server...")
         logger.info("📡 STDIO transport ready for MCP client connection")
         logger.info("✅ Server startup completed successfully")
+        get_redis_client()
+        get_redis_client_persistence()
         
         # Run the FastMCP server (handles its own event loop)
         mcp.run()

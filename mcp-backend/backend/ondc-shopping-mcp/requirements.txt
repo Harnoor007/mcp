@@ -24,3 +24,4 @@ firebase-admin>=6.2.0
 
 # Utilities
 aiofiles>=23.2.1
+redis>=5.0.1

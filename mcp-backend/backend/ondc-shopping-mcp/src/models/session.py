@@ -463,6 +463,16 @@ class Session:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Session':
         """Create Session from dictionary"""
+        def safe_parse_datetime(value):
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value)
+                except ValueError:
+                    return datetime.utcnow()
+            elif isinstance(value, datetime):
+                return value
+            else:
+                return datetime.utcnow()
         return cls(
             session_id=data['session_id'],
             user_id=data.get('user_id'),  # No default, must be from auth
@@ -472,8 +482,9 @@ class Session:
             preferences=UserPreferences.from_dict(data.get('preferences', {})),
             history=data.get('history', []),
             search_history=data.get('search_history', []),
-            created_at=datetime.fromisoformat(data['created_at']) if 'created_at' in data else datetime.utcnow(),
-            last_accessed=datetime.fromisoformat(data['last_accessed']) if 'last_accessed' in data else datetime.utcnow(),
+            created_at=safe_parse_datetime(data.get('created_at')),
+            # last_accessed=datetime.fromisoformat(data['last_accessed']) if 'last_accessed' in data else datetime.utcnow(),
+            last_accessed=safe_parse_datetime(data.get('last_accessed')),
             auth_token=data.get('auth_token'),
             user_authenticated=data.get('user_authenticated', False),
             user_profile=data.get('user_profile'),
