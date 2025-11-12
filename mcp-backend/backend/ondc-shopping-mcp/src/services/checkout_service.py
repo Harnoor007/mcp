@@ -694,146 +694,12 @@ class CheckoutService:
                     'message': f" {validation_result['error']['message']}"
                 }
             
-            # Step 3: Get delivery location from SELECT stage or parameters
-            # Use provided parameters or fall back to stored delivery info
-            final_city = city or session.checkout_state.delivery_info.city if session.checkout_state.delivery_info else "Bangalore"
-            final_state = state or session.checkout_state.delivery_info.city if session.checkout_state.delivery_info else "Karnataka" 
-            final_pincode = pincode or "560001"  # Should be captured from SELECT stage
-            
-            # Step 4-6: REMOVED - Not needed for Postman format
-            # The simple Postman context will be created later with only 3 fields
-            
-            # Step 7-10: Set session state and prepare for Postman format
-            session.checkout_state.delivery_info = DeliveryInfo(
-                address=delivery_address,
-                phone=phone,
-                email=email,
-                name=customer_name,
-                city=final_city,
-                pincode=final_pincode
+            init_data = await self._prepare_init_request_data(
+                session, enriched_items, customer_name, delivery_address, phone, email, payment_method, city, state, pincode
             )
-            session.checkout_state.payment_method = payment_method.lower()
-            
-            # Step 11: RESTORE to exact working Postman collection format
-            # CRITICAL: Use EXACT format that works in Postman - don't modify anything!
-            
-            # Fixed GPS coordinates for delivery area
-            gps_coords = "12.9716,77.5946"  # Bangalore coordinates as string
-            
-            # Create delivery_info exactly matching Postman
-            delivery_info_postman = {
-                'type': 'Delivery',
-                'phone': phone,
-                'name': customer_name,
-                'email': email,
-                'location': {
-                    'gps': gps_coords,
-                    'address': {
-                        'name': customer_name,
-                        'building': delivery_address,
-                        'street': 'abc',
-                        'locality': 'abc',
-                        'city': final_city,
-                        'state': final_state,
-                        'country': 'India',
-                        'areaCode': final_pincode,
-                        'tag': 'Home',
-                        'lat': '12.9716',  # String format like Postman
-                        'lng': '77.5946',  # String format like Postman
-                        'email': email
-                    }
-                }
-            }
-            
-            # Create billing_info exactly matching Postman
-            billing_info_postman = {
-                'address': {
-                    'name': customer_name,
-                    'building': delivery_address,
-                    'street': 'abc',
-                    'locality': 'abc',
-                    'city': final_city,
-                    'state': final_state,
-                    'country': 'India',
-                    'areaCode': final_pincode,
-                    'tag': 'Home',
-                    'lat': '12.9716',  # String format like Postman
-                    'lng': '77.5946',  # String format like Postman
-                    'email': email
-                },
-                'phone': phone,
-                'name': customer_name,
-                'email': email
-            }
-            
-            # Transform items to exact Postman format with real backend data
-            postman_items = []
-            for item in enriched_items:
-                # Create proper tags array like Postman (using real data from item.tags)
-                item_tags = item.tags if item.tags else [
-                    {
-                        'code': 'origin',
-                        'list': [{'code': 'country', 'value': 'India'}]
-                    },
-                    {
-                        'code': 'type', 
-                        'list': [{'code': 'type', 'value': 'item'}]
-                    },
-                    {
-                        'code': 'veg_nonveg',
-                        'list': [{'code': 'veg', 'value': 'yes'}]
-                    }
-                ]
-                
-                # Extract provider local_id from provider_id
-                provider_local_id = item.local_id  # Use same as item local_id
-                if hasattr(item, 'provider') and item.provider and isinstance(item.provider, dict):
-                    provider_local_id = item.provider.get('local_id', item.local_id)
-                
-                postman_item = {
-                    'id': item.id,  # Full ONDC ID 
-                    'local_id': item.local_id,
-                    'tags': item_tags,
-                    'fulfillment_id': 'Fulfillment1',
-                    'quantity': {'count': item.quantity},
-                    'provider': {
-                        'id': item.provider_id,
-                        'local_id': provider_local_id,
-                        'locations': [{
-                            'id': item.provider_id + '_' + provider_local_id,  # Full ONDC location ID
-                            'local_id': provider_local_id
-                        }]
-                    },
-                    'customisations': None,
-                    'hasCustomisations': False,
-                    'userId': ''  # Empty string exactly like Postman
-                }
-                postman_items.append(postman_item)
-            
-            # Create simple context exactly matching Postman (only 3 fields!)
-            postman_context = {
-                'transaction_id': session.checkout_state.transaction_id,
-                'city': final_pincode,  # Use pincode as city like Postman
-                'domain': 'ONDC:RET10'
-            }
-            
-            # EXACT Postman format with array wrapper
-            init_data = [{
-                'context': postman_context,
-                'message': {
-                    'items': postman_items,
-                    'billing_info': billing_info_postman,
-                    'delivery_info': delivery_info_postman,
-                    'payment': {
-                        'type': 'ON-ORDER'
-                    }
-                },
-                'deviceId': getattr(session, 'device_id', config.guest.device_id)
-            }]
             
             # Log INIT request summary
             logger.info(f"[CheckoutService] Sending INIT request for session {session.session_id}")
-            logger.info(f"[CheckoutService] Transaction ID: {postman_context.get('transaction_id')}")
             
             # Step 13: Call BIAP INIT API - GUEST MODE
             # Guest mode: No authentication required for order initialization
@@ -908,7 +774,6 @@ class CheckoutService:
                         'delivery': delivery_address,
                         'payment': payment_method.upper()
                     },
-                    'init_data': result,
                     'next_step': 'create_payment'
                 }
             else:
@@ -924,6 +789,116 @@ class CheckoutService:
                 'success': False,
                 'message': ' Failed to initialize order. Please try again.'
             }
+
+    async def _prepare_init_request_data(
+        self,
+        session: Session,
+        enriched_items: List[Dict[str, Any]],
+        customer_name: str,
+        delivery_address: str,
+        phone: str,
+        email: str,
+        payment_method: str,
+        city: Optional[str] = None,
+        state: Optional[str] = None,
+        pincode: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        # Step 3: Get delivery location from SELECT stage or parameters
+        final_city = city or (session.checkout_state.delivery_info.city if session.checkout_state.delivery_info else "Bangalore")
+        final_state = state or (session.checkout_state.delivery_info.state if session.checkout_state.delivery_info else "Karnataka")
+        final_pincode = pincode or "560001"
+
+        # Step 7-10: Set session state and prepare for Postman format
+        session.checkout_state.delivery_info = DeliveryInfo(
+            address=delivery_address,
+            phone=phone,
+            email=email,
+            name=customer_name,
+            city=final_city,
+            pincode=final_pincode
+        )
+        session.checkout_state.payment_method = payment_method.lower()
+
+        # Step 11: RESTORE to exact working Postman collection format
+        gps_coords = "12.9716,77.5946"  # Bangalore coordinates as string
+
+        delivery_info_postman = {
+            'type': 'Delivery',
+            'phone': phone,
+            'name': customer_name,
+            'email': email,
+            'location': {
+                'gps': gps_coords,
+                'address': {
+                    'name': customer_name,
+                    'building': delivery_address,
+                    'city': final_city,
+                    'state': final_state,
+                    'country': 'India',
+                    'areaCode': final_pincode,
+                    'tag': 'Home',
+                    'email': email
+                }
+            }
+        }
+
+        billing_info_postman = {
+            'address': {
+                'name': customer_name,
+                'building': delivery_address,
+                'city': final_city,
+                'state': final_state,
+                'country': 'India',
+                'areaCode': final_pincode,
+                'tag': 'Home',
+                'email': email
+            },
+            'phone': phone,
+            'name': customer_name,
+            'email': email
+        }
+
+        postman_items = []
+        for item in enriched_items:
+            item_tags = item.tags if item.tags else [
+                {'code': 'origin', 'list': [{'code': 'country', 'value': 'India'}]},
+                {'code': 'type', 'list': [{'code': 'type', 'value': 'item'}]},
+                {'code': 'veg_nonveg', 'list': [{'code': 'veg', 'value': 'yes'}]}
+            ]
+            provider_local_id = item.local_id
+            if hasattr(item, 'provider') and item.provider and isinstance(item.provider, dict):
+                provider_local_id = item.provider.get('local_id', item.local_id)
+            postman_item = {
+                'id': item.id,
+                'local_id': item.local_id,
+                'tags': item_tags,
+                'fulfillment_id': 'Fulfillment1',
+                'quantity': {'count': item.quantity},
+                'provider': {
+                    'id': item.provider_id,
+                    'local_id': provider_local_id,
+                    'locations': [{'id': f"{item.provider_id}_{provider_local_id}", 'local_id': provider_local_id}]
+                }
+            }
+            postman_items.append(postman_item)
+
+        postman_context = {
+            'transaction_id': session.checkout_state.transaction_id,
+            'city': final_pincode,
+            'domain': 'ONDC:RET10'
+        }
+
+        init_payload = {
+            'context': postman_context,
+            'message': {
+                'items': postman_items,
+                'billing_info': billing_info_postman,
+                'delivery_info': delivery_info_postman,
+                'payment': {'type': 'ON-ORDER'}
+            },
+            'deviceId': getattr(session, 'device_id', config.guest.device_id)
+        }
+        return [_compact_dict(init_payload)]
     
     async def create_payment(self, session: Session, payment_method: str = 'razorpay', amount: Optional[float] = None) -> Dict[str, Any]:
         """
