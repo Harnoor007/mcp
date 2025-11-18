@@ -287,29 +287,29 @@ class CheckoutService:
                 'success': False,
                 'message': ' Cart is empty. Please add items first.'
             }
-        
+
         # Validate delivery location
         if not all([delivery_city, delivery_state, delivery_pincode]):
             return {
                 'success': False,
                 'message': ' Missing delivery location. Please provide city, state, and pincode.'
             }
-        
+
         # Generate transaction ID for this checkout session
         session.checkout_state.transaction_id = self._generate_transaction_id()
-        
+
         try:
             logger.info(f"[CheckoutService] Starting SELECT with {len(session.cart.items)} items")
             logger.debug(f"[CheckoutService] Delivery location: {delivery_city}, {delivery_state}, {delivery_pincode}")
             logger.debug(f"[CheckoutService] Cart items: {[{'name': item.name, 'id': item.id, 'local_id': getattr(item, 'local_id', None)} for item in session.cart.items]}")
-            
+
             # Step 1: Enrich cart items with BIAP product data
             logger.info("[CheckoutService] Step 1: Enriching cart items with BIAP product data...")
             enriched_items = await self.product_enrichment.enrich_cart_items(
                 session.cart.items, session.session_id
             )
             logger.debug(f"[CheckoutService] Enriched {len(enriched_items)} items")
-            
+
             # Step 2: BIAP validation - check for multiple BPP/Provider items
             logger.info("[CheckoutService] Step 2: Validating order items for BIAP compliance...")
             validation_result = self.validation.validate_order_items(enriched_items, "select")
@@ -320,12 +320,12 @@ class CheckoutService:
                     'success': False,
                     'message': f" {validation_result['error']['message']}"
                 }
-            
+
             # Step 3: Get proper city code from pincode
             logger.info(f"[CheckoutService] Step 3: Getting city code for pincode {delivery_pincode}...")
             city_code = get_city_code_by_pincode(delivery_pincode)
             logger.debug(f"[CheckoutService] City code: {city_code}")
-            
+
             # Step 4: Create BIAP-compatible context (match Himira documentation format)
             logger.info("[CheckoutService] Step 4: Creating BIAP-compatible context...")
             context = self.context_factory.create({
@@ -335,7 +335,7 @@ class CheckoutService:
                 'pincode': delivery_pincode
             })
             logger.debug(f"[CheckoutService] Context created: {json.dumps(context, indent=2)}")
-            
+
             # Step 5: Get BPP info from validated items
             logger.info("[CheckoutService] Step 5: Getting BPP info from validated items...")
             bpp_info = self.validation.get_order_bpp_info(enriched_items)
@@ -344,13 +344,13 @@ class CheckoutService:
                 context['bpp_id'] = bpp_info['bpp_id']
                 context['bpp_uri'] = bpp_info['bpp_uri']
                 logger.info(f"[CheckoutService] Using BPP: {bpp_info['bpp_id']} at {bpp_info['bpp_uri']}")
-            
+
             # Step 6: Transform enriched items to BIAP SELECT format
             logger.info("[CheckoutService] Step 6: Transforming items to BIAP SELECT format...")
             select_items = []
             location_set = set()
             provider_info = None
-            
+
             for item in enriched_items:
                 # Create SELECT item structure (Postman collection format)
                 select_item = {
@@ -361,7 +361,7 @@ class CheckoutService:
                     'customisations': None,          # Required by Postman format
                     'hasCustomisations': False       # Required by Postman format
                 }
-                
+
                 # Add product structure for biap backend compatibility
                 if item.location_id:
                     # CRITICAL FIX: biap backend expects item.product.location_id, not item.location_id
@@ -371,26 +371,26 @@ class CheckoutService:
                     # Also keep the direct location_id for backward compatibility
                     select_item['location_id'] = item.location_id
                     location_set.add(item.location_id)
-                
+
                 # Add provider at item level using utility
                 if item.provider:
                     select_item['provider'] = create_provider_for_context(
                         item.provider, 
                         context="item"
                     )
-                
+
                 # Capture provider info from first item
                 if not provider_info and item.provider:
                     provider_info = item.provider
-                
+
                 select_items.append(select_item)
-            
+
             # Step 7: Build location objects using utility
             location_objs = build_location_objects(location_set, provider_info)
-            
+
             # Step 8: Create SELECT request matching working Postman collection
             # Backend expects message.cart structure with provider at cart level
-            
+
             # Create provider at cart level using utility
             cart_provider = create_provider_for_context(
                 provider_info, 
@@ -431,7 +431,7 @@ class CheckoutService:
                 'userId': session.session_id,
                 'deviceId': getattr(session, 'device_id', config.guest.device_id)
             }
-            
+
             logger.info("[CheckoutService] Step 9: Calling BIAP SELECT API...")
             # Enhanced debug logging for SELECT request
             logger.info(f"[CheckoutService] SELECT request summary:")
@@ -440,13 +440,13 @@ class CheckoutService:
             logger.info(f"  - Delivery pincode: {delivery_pincode}")
             logger.info(f"  - Cart provider ID: {cart_provider['id'] if cart_provider else 'None'}")
             logger.info(f"  - Cart provider locations: {len(cart_provider.get('locations', [])) if cart_provider else 0}")
-            
+
             # CRITICAL VALIDATION: Ensure provider locations match working curl format
             if cart_provider and 'locations' in cart_provider:
                 logger.info(f"[CheckoutService] Validating provider location structure:")
                 logger.info(f"  Provider ID: {cart_provider.get('id')}")
                 logger.info(f"  Provider local_id: {cart_provider.get('local_id')}")
-                
+
                 for idx, loc in enumerate(cart_provider['locations']):
                     logger.info(f"  - Location[{idx}]: {json.dumps(loc)}")
                     if isinstance(loc, dict):
@@ -454,7 +454,7 @@ class CheckoutService:
                         has_local_id = 'local_id' in loc
                         logger.info(f"    Has 'id' field: {has_id}")
                         logger.info(f"    Has 'local_id' field: {has_local_id}")
-                        
+
                         # Validate against working curl format
                         if has_id and has_local_id:
                             # Verify ONDC format for ID (should contain underscores)
@@ -475,7 +475,7 @@ class CheckoutService:
                                 from ..utils.ondc_constants import HIMIRA_LOCATION_LOCAL_ID
                                 loc['id'] = HIMIRA_LOCATION_LOCAL_ID
                                 logger.info(f"[CheckoutService] Set default location id: {HIMIRA_LOCATION_LOCAL_ID}")
-                                
+
                         # Final validation after any fixes
                         if 'id' in loc and 'local_id' in loc:
                             logger.info(f"    ✅ Location validation passed: {json.dumps(loc)}")
@@ -483,9 +483,10 @@ class CheckoutService:
                             logger.error(f"    ❌ Location validation failed: missing required fields")
             else:
                 logger.warning(f"[CheckoutService] No provider locations found in cart_provider: {cart_provider}")
-            
+
             logger.debug(f"[CheckoutService] Full SELECT request payload:\n{json.dumps(select_data, indent=2)}")
-            
+
+
             # GUEST MODE: SELECT API call without authentication
             auth_token = getattr(session, 'auth_token', None)
             if not auth_token:
@@ -494,14 +495,14 @@ class CheckoutService:
                 auth_token = None
             else:
                 logger.info("[CheckoutService] Using auth token for SELECT request")
-            
+
             # Call BIAP SELECT API (works with or without auth token for guest)
             # FIXED: Remove double array wrapping - buyer_backend_client will wrap correctly
             select_response = await self.buyer_app.select_items(select_data, auth_token=auth_token)
-            
+
             logger.info(f"[CheckoutService] SELECT API initial response received")
             logger.debug(f"[CheckoutService] SELECT initial response: {json.dumps(select_response, indent=2) if select_response else 'None'}")
-            
+
             # Extract message ID from response for polling
             # FIXED: For array responses, extract messageId from first item's context
             # Matches frontend pattern: data?.map((txn) => txn.context?.message_id)
@@ -521,7 +522,7 @@ class CheckoutService:
                     if isinstance(context, dict):
                         message_id = context.get('message_id')
                         logger.info(f"[CheckoutService] Extracted messageId from dict response: {message_id}")
-                        
+
             # Log response structure for debugging if no messageId found
             if not message_id:
                 logger.error(f"[CheckoutService] No messageId found in response structure:")
@@ -534,16 +535,16 @@ class CheckoutService:
                             logger.error(f"  First item keys: {list(select_response[0].keys())}")
                 elif isinstance(select_response, dict):
                     logger.error(f"  Dict keys: {list(select_response.keys())}")
-            
+
             if not message_id:
                 logger.error(f"[CheckoutService] No messageId in SELECT response: {select_response}")
                 return {
                     'success': False,
                     'message': ' Failed to initiate SELECT request. No message ID received.'
                 }
-            
+
             logger.info(f"[CheckoutService] Polling for SELECT response with messageId: {message_id}")
-            
+
             # Poll for the actual SELECT response
             result = await self._poll_for_response(
                 poll_function=self.buyer_app.get_select_response,
@@ -553,9 +554,9 @@ class CheckoutService:
                 initial_delay=2.0,
                 auth_token=auth_token
             )
-            
+
             logger.debug(f"[CheckoutService] Final SELECT response after polling: {json.dumps(result, indent=2) if result else 'None'}")
-            
+
             # FIXED: Handle ONDC response structure properly - error: null indicates success
             if result and (result.get('error') is None or result.get('error') == "null"):
                 # Update session to SELECT stage
@@ -566,9 +567,9 @@ class CheckoutService:
                     'pincode': delivery_pincode,
                     'items_count': len(session.cart.items)
                 })
-                
+
                 logger.info("[CheckoutService]  SELECT successful - delivery quotes received")
-                
+
                 # Smart next_step based on address source
                 if address_auto_fetched:
                     next_step = 'ready_for_initialize_order'
@@ -578,7 +579,7 @@ class CheckoutService:
                     next_step = 'provide_complete_delivery_details'
                     message = f' Delivery available in {delivery_city}! Please provide your complete delivery details to proceed.'
                     logger.info(f"[CheckoutService] MANUAL-ADDRESS: Need complete delivery details")
-                
+
                 return {
                     'success': True,
                     'message': message,
@@ -594,14 +595,13 @@ class CheckoutService:
                     'success': False,
                     'message': f' {error_msg}'
                 }
-                
+
         except Exception as e:
             logger.error(f"[CheckoutService] SELECT operation failed with exception: {e}", exc_info=True)
             return {
                 'success': False,
                 'message': ' Failed to get delivery options. Please try again.'
             }
-    
     async def initialize_order(
         self,
         session: Session,
@@ -643,46 +643,46 @@ class CheckoutService:
                 'success': False,
                 'message': ' Please select delivery location first.'
             }
-        
+
         # Validate all required information
         missing = []
         if not customer_name: missing.append("customer name")
         if not delivery_address: missing.append("delivery address")
         if not phone: missing.append("phone number")
         if not email: missing.append("email")
-        
+
         if missing:
             return {
                 'success': False,
                 'message': f' Missing: {", ".join(missing)}'
             }
-        
+
         # Validate payment method - COD NOT SUPPORTED by Himira backend
         if config.payment.enable_cod_payments:
             valid_methods = ['razorpay', 'upi', 'card', 'netbanking', 'cod']  # COD enabled (for testing)
         else:
             valid_methods = ['razorpay', 'upi', 'card', 'netbanking']  # COD disabled (production)
-            
+
         if payment_method.lower() not in valid_methods:
             return {
                 'success': False,
                 'message': f' Invalid payment method. COD not supported by Himira backend. Choose: {", ".join(valid_methods)}'
             }
-            
+
         # Log payment method selection with mock indicators
         if config.payment.debug_logs:
             logger.info(f"[PAYMENT METHOD] Selected: {payment_method.lower()}")
             logger.info(f"[PAYMENT CONFIG] COD enabled: {config.payment.enable_cod_payments}")
             logger.info(f"[PAYMENT CONFIG] Mock mode: {config.payment.mock_mode}")
-        
+
         try:
             logger.info(f"[CheckoutService] Starting INIT for customer: {customer_name}")
-            
+
             # Step 1: Get enriched items for validation
             enriched_items = await self.product_enrichment.enrich_cart_items(
                 session.cart.items, session.session_id
             )
-            
+
             # Step 2: BIAP validation - check for multiple BPP/Provider items  
             validation_result = self.validation.validate_order_items(enriched_items, "init")
             if not validation_result.get('success'):
@@ -690,7 +690,7 @@ class CheckoutService:
                     'success': False,
                     'message': f" {validation_result['error']['message']}"
                 }
-            
+
             # Step 3: Get delivery location from SELECT stage or parameters
             # Use provided parameters or fall back to stored delivery info
             final_city = city or session.checkout_state.delivery_info.city if session.checkout_state.delivery_info else "Bangalore"
@@ -827,11 +827,11 @@ class CheckoutService:
                 },
                 'deviceId': getattr(session, 'device_id', config.guest.device_id)
             }]
-            
+
             # Log INIT request summary
             logger.info(f"[CheckoutService] Sending INIT request for session {session.session_id}")
             logger.info(f"[CheckoutService] Transaction ID: {postman_context.get('transaction_id')}")
-            
+
             # Step 13: Call BIAP INIT API - GUEST MODE
             # Guest mode: No authentication required for order initialization
             auth_token = getattr(session, 'auth_token', None)
@@ -839,12 +839,12 @@ class CheckoutService:
                 logger.info("[CheckoutService] GUEST MODE - Proceeding without auth token")
                 # For guest users, we'll use wil-api-key authentication only
                 auth_token = None
-            
+
             init_response = await self.buyer_app.initialize_order(init_data, auth_token=auth_token)
-            
+
             logger.info(f"[CheckoutService] INIT API initial response received")
             logger.debug(f"[CheckoutService] INIT initial response: {json.dumps(init_response, indent=2) if init_response else 'None'}")
-            
+
             # Extract message ID from response for polling - FIXED for array format
             message_id = None
             if init_response:
@@ -862,16 +862,16 @@ class CheckoutService:
                         message_id = context.get('message_id') or context.get('messageId')
                     else:
                         message_id = init_response.get('messageId') or init_response.get('message_id')
-            
+
             if not message_id:
                 logger.error(f"[CheckoutService] No messageId in INIT response: {init_response}")
                 return {
                     'success': False,
                     'message': ' Failed to initiate order initialization. No message ID received.'
                 }
-            
+
             logger.info(f"[CheckoutService] Polling for INIT response with messageId: {message_id}")
-            
+
             # Poll for the actual INIT response
             result = await self._poll_for_response(
                 poll_function=self.buyer_app.get_init_response,
@@ -881,9 +881,9 @@ class CheckoutService:
                 initial_delay=2.0,
                 auth_token=auth_token
             )
-            
+
             logger.debug(f"[CheckoutService] Final INIT response after polling: {json.dumps(result, indent=2) if result else 'None'}")
-            
+
             # FIXED: Handle ONDC response structure properly - error: null indicates success
             if result and (result.get('error') is None or result.get('error') == "null"):
                 # Update session to INIT stage  
@@ -894,7 +894,7 @@ class CheckoutService:
                     'email': email,
                     'payment_method': payment_method
                 })
-                
+
                 return {
                     'success': True,
                     'message': f' Order initialized successfully! Your order will be delivered to: {delivery_address}. Contact: {phone}, {email}. Payment method: {payment_method.upper()}',
@@ -914,13 +914,122 @@ class CheckoutService:
                     'success': False,
                     'message': f' {error_msg}'
                 }
-                
+
         except Exception as e:
             logger.error(f"INIT operation failed: {e}")
             return {
                 'success': False,
                 'message': ' Failed to initialize order. Please try again.'
             }
+    async def _prepare_init_request_data(
+        self,
+        session: Session,
+        enriched_items: List[Dict[str, Any]],
+        customer_name: str,
+        delivery_address: str,
+        phone: str,
+        email: str,
+        payment_method: str,
+        city: Optional[str] = None,
+        state: Optional[str] = None,
+        pincode: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        # Step 3: Get delivery location from SELECT stage or parameters
+        final_city = city or (session.checkout_state.delivery_info.city if session.checkout_state.delivery_info else "Bangalore")
+        final_state = state or (session.checkout_state.delivery_info.state if session.checkout_state.delivery_info else "Karnataka")
+        final_pincode = pincode or "560001"
+
+        # Step 7-10: Set session state and prepare for Postman format
+        session.checkout_state.delivery_info = DeliveryInfo(
+            address=delivery_address,
+            phone=phone,
+            email=email,
+            name=customer_name,
+            city=final_city,
+            pincode=final_pincode
+        )
+        session.checkout_state.payment_method = payment_method.lower()
+
+        # Step 11: RESTORE to exact working Postman collection format
+        gps_coords = "12.9716,77.5946"  # Bangalore coordinates as string
+
+        delivery_info_postman = {
+            'type': 'Delivery',
+            'phone': phone,
+            'name': customer_name,
+            'email': email,
+            'location': {
+                'gps': gps_coords,
+                'address': {
+                    'name': customer_name,
+                    'building': delivery_address,
+                    'city': final_city,
+                    'state': final_state,
+                    'country': 'India',
+                    'areaCode': final_pincode,
+                    'tag': 'Home',
+                    'email': email
+                }
+            }
+        }
+
+        billing_info_postman = {
+            'address': {
+                'name': customer_name,
+                'building': delivery_address,
+                'city': final_city,
+                'state': final_state,
+                'country': 'India',
+                'areaCode': final_pincode,
+                'tag': 'Home',
+                'email': email
+            },
+            'phone': phone,
+            'name': customer_name,
+            'email': email
+        }
+
+        postman_items = []
+        for item in enriched_items:
+            item_tags = item.tags if item.tags else [
+                {'code': 'origin', 'list': [{'code': 'country', 'value': 'India'}]},
+                {'code': 'type', 'list': [{'code': 'type', 'value': 'item'}]},
+                {'code': 'veg_nonveg', 'list': [{'code': 'veg', 'value': 'yes'}]}
+            ]
+            provider_local_id = item.local_id
+            if hasattr(item, 'provider') and item.provider and isinstance(item.provider, dict):
+                provider_local_id = item.provider.get('local_id', item.local_id)
+            postman_item = {
+                'id': item.id,
+                'local_id': item.local_id,
+                'tags': item_tags,
+                'fulfillment_id': 'Fulfillment1',
+                'quantity': {'count': item.quantity},
+                'provider': {
+                    'id': item.provider_id,
+                    'local_id': provider_local_id,
+                    'locations': [{'id': f"{item.provider_id}_{provider_local_id}", 'local_id': provider_local_id}]
+                }
+            }
+            postman_items.append(postman_item)
+
+        postman_context = {
+            'transaction_id': session.checkout_state.transaction_id,
+            'city': final_pincode,
+            'domain': 'ONDC:RET10'
+        }
+
+        init_payload = {
+            'context': postman_context,
+            'message': {
+                'items': postman_items,
+                'billing_info': billing_info_postman,
+                'delivery_info': delivery_info_postman,
+                'payment': {'type': 'ON-ORDER'}
+            },
+            'deviceId': getattr(session, 'device_id', config.guest.device_id)
+        }
+        return [init_payload]
     
     async def create_payment(self, session: Session, payment_method: str = 'razorpay', amount: Optional[float] = None) -> Dict[str, Any]:
         """

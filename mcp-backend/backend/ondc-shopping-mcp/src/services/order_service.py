@@ -64,9 +64,26 @@ class OrderService:
         try:
             logger.info(f"[Order] Starting SELECT flow for {len(items)} items")
             
+            # Optimization: Filter items to reduce payload size for the SELECT call.
+            filtered_items = []
+            for item in items:
+                quantity = item.get('quantity', 1)
+                if not isinstance(quantity, dict):
+                    quantity_obj = {'count': int(quantity)}
+                else:
+                    quantity_obj = quantity
+                
+                filtered_item = {
+                    'id': item.get('id'),
+                    'quantity': quantity_obj,
+                    'provider_id': item.get('provider_id'),
+                    'location_id': item.get('provider_location')
+                }
+                filtered_items.append({k: v for k, v in filtered_item.items() if v is not None})
+
             # Prepare SELECT request data with all required ONDC fields
             select_data = {
-                "items": items,
+                "items": filtered_items,
                 "delivery_location": delivery_location or {
                     "gps": "30.7455808,76.6537325",  # Default Bangalore coordinates
                     "address": {
