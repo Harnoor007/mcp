@@ -287,29 +287,29 @@ class CheckoutService:
                 'success': False,
                 'message': ' Cart is empty. Please add items first.'
             }
-        
+
         # Validate delivery location
         if not all([delivery_city, delivery_state, delivery_pincode]):
             return {
                 'success': False,
                 'message': ' Missing delivery location. Please provide city, state, and pincode.'
             }
-        
+
         # Generate transaction ID for this checkout session
         session.checkout_state.transaction_id = self._generate_transaction_id()
-        
+
         try:
             logger.info(f"[CheckoutService] Starting SELECT with {len(session.cart.items)} items")
             logger.debug(f"[CheckoutService] Delivery location: {delivery_city}, {delivery_state}, {delivery_pincode}")
             logger.debug(f"[CheckoutService] Cart items: {[{'name': item.name, 'id': item.id, 'local_id': getattr(item, 'local_id', None)} for item in session.cart.items]}")
-            
+
             # Step 1: Enrich cart items with BIAP product data
             logger.info("[CheckoutService] Step 1: Enriching cart items with BIAP product data...")
             enriched_items = await self.product_enrichment.enrich_cart_items(
                 session.cart.items, session.session_id
             )
             logger.debug(f"[CheckoutService] Enriched {len(enriched_items)} items")
-            
+
             # Step 2: BIAP validation - check for multiple BPP/Provider items
             logger.info("[CheckoutService] Step 2: Validating order items for BIAP compliance...")
             validation_result = self.validation.validate_order_items(enriched_items, "select")
@@ -320,12 +320,12 @@ class CheckoutService:
                     'success': False,
                     'message': f" {validation_result['error']['message']}"
                 }
-            
+
             # Step 3: Get proper city code from pincode
             logger.info(f"[CheckoutService] Step 3: Getting city code for pincode {delivery_pincode}...")
             city_code = get_city_code_by_pincode(delivery_pincode)
             logger.debug(f"[CheckoutService] City code: {city_code}")
-            
+
             # Step 4: Create BIAP-compatible context (match Himira documentation format)
             logger.info("[CheckoutService] Step 4: Creating BIAP-compatible context...")
             context = self.context_factory.create({
@@ -335,7 +335,7 @@ class CheckoutService:
                 'pincode': delivery_pincode
             })
             logger.debug(f"[CheckoutService] Context created: {json.dumps(context, indent=2)}")
-            
+
             # Step 5: Get BPP info from validated items
             logger.info("[CheckoutService] Step 5: Getting BPP info from validated items...")
             bpp_info = self.validation.get_order_bpp_info(enriched_items)
@@ -344,21 +344,24 @@ class CheckoutService:
                 context['bpp_id'] = bpp_info['bpp_id']
                 context['bpp_uri'] = bpp_info['bpp_uri']
                 logger.info(f"[CheckoutService] Using BPP: {bpp_info['bpp_id']} at {bpp_info['bpp_uri']}")
-            
+
             # Step 6: Transform enriched items to BIAP SELECT format
             logger.info("[CheckoutService] Step 6: Transforming items to BIAP SELECT format...")
             select_items = []
             location_set = set()
             provider_info = None
-            
+
             for item in enriched_items:
                 # Create SELECT item structure (Postman collection format)
                 select_item = {
                     'id': item.id,                   # Full ONDC ID
                     'local_id': item.local_id,       # UUID local ID
-                    'quantity': {'count': item.quantity},  
-                    }
-                
+                    'quantity': {'count': item.quantity},  # Wrapped in count object
+                    'customisationState': {},        # Required by Postman format
+                    'customisations': None,          # Required by Postman format
+                    'hasCustomisations': False       # Required by Postman format
+                }
+
                 # Add product structure for biap backend compatibility
                 if item.location_id:
                     # CRITICAL FIX: biap backend expects item.product.location_id, not item.location_id
@@ -368,35 +371,45 @@ class CheckoutService:
                     # Also keep the direct location_id for backward compatibility
                     select_item['location_id'] = item.location_id
                     location_set.add(item.location_id)
-                
+
                 # Add provider at item level using utility
                 if item.provider:
                     select_item['provider'] = create_provider_for_context(
                         item.provider, 
                         context="item"
                     )
-                
+
                 # Capture provider info from first item
                 if not provider_info and item.provider:
                     provider_info = item.provider
-                
+
                 select_items.append(select_item)
-            
+
             # Step 7: Build location objects using utility
             location_objs = build_location_objects(location_set, provider_info)
-            
+
             # Step 8: Create SELECT request matching working Postman collection
             # Backend expects message.cart structure with provider at cart level
-            
+
             # Create provider at cart level using utility
             cart_provider = create_provider_for_context(
-                provider_info,
+                provider_info, 
                 context="cart"
             ) if provider_info else None
-
+            
+            cart_obj = {
+                'items': select_items  # Items have provider at item level
+            }
+            
+            # Add provider at cart level if available (for backend transformation)
+            if cart_provider:
+                cart_obj['provider'] = cart_provider
+                logger.debug(f"[CheckoutService] Cart provider: {json.dumps(cart_provider, indent=2)}")
+            
             # Get GPS coordinates using centralized utility
             gps_coords = get_city_gps(delivery_city)
             logger.debug(f"[CheckoutService] GPS coordinates for {delivery_city}: {gps_coords}")
+            
             #  CRITICAL: Simplify fulfillments to match Postman collection exactly
             fulfillments_obj = [{
                 'end': {
@@ -408,31 +421,34 @@ class CheckoutService:
                     }
                 }
             }]
-
-            # Per API error, structure the message with an 'order' object instead of 'cart'
-            order_payload = {
-                'items': select_items,
-                'provider': cart_provider,
-                'fulfillments': fulfillments_obj
+            
+            select_data = {
+                'context': context,
+                'message': {
+                    'cart': cart_obj,             #  Backend expects 'cart' (confirmed from Postman collection)
+                    'fulfillments': fulfillments_obj  #  At message level as backend expects
+                },
+                'userId': session.session_id,
+                'deviceId': getattr(session, 'device_id', config.guest.device_id)
             }
+            
 
-            select_data = _compact_dict({
-                    "context": context,
-                    "message": {
-                        "cart": {   # revert to cart unless BIAP explicitly expects 'order'
-                             "items": select_items,
-                            "provider": cart_provider
-                            },
-                        "fulfillments": fulfillments_obj
-                        },
-                    "userId": session.session_id,
-                    "deviceId": getattr(session, 'device_id', config.guest.device_id)
-})
 
-            select_data = _compact_dict(select_data)
-            logger.info(f"[CheckoutService] SELECT request payload: {_safe_json(select_data)}")
-            auth_token = getattr(session, 'auth_token', None)
-            select_response = await self.buyer_app.select_items(select_data, auth_token=auth_token)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
             logger.info("[CheckoutService] Step 9: Calling BIAP SELECT API...")
             # Enhanced debug logging for SELECT request
@@ -442,13 +458,13 @@ class CheckoutService:
             logger.info(f"  - Delivery pincode: {delivery_pincode}")
             logger.info(f"  - Cart provider ID: {cart_provider['id'] if cart_provider else 'None'}")
             logger.info(f"  - Cart provider locations: {len(cart_provider.get('locations', [])) if cart_provider else 0}")
-            
+
             # CRITICAL VALIDATION: Ensure provider locations match working curl format
             if cart_provider and 'locations' in cart_provider:
                 logger.info(f"[CheckoutService] Validating provider location structure:")
                 logger.info(f"  Provider ID: {cart_provider.get('id')}")
                 logger.info(f"  Provider local_id: {cart_provider.get('local_id')}")
-                
+
                 for idx, loc in enumerate(cart_provider['locations']):
                     logger.info(f"  - Location[{idx}]: {json.dumps(loc)}")
                     if isinstance(loc, dict):
@@ -456,7 +472,7 @@ class CheckoutService:
                         has_local_id = 'local_id' in loc
                         logger.info(f"    Has 'id' field: {has_id}")
                         logger.info(f"    Has 'local_id' field: {has_local_id}")
-                        
+
                         # Validate against working curl format
                         if has_id and has_local_id:
                             # Verify ONDC format for ID (should contain underscores)
@@ -477,7 +493,7 @@ class CheckoutService:
                                 from ..utils.ondc_constants import HIMIRA_LOCATION_LOCAL_ID
                                 loc['id'] = HIMIRA_LOCATION_LOCAL_ID
                                 logger.info(f"[CheckoutService] Set default location id: {HIMIRA_LOCATION_LOCAL_ID}")
-                                
+
                         # Final validation after any fixes
                         if 'id' in loc and 'local_id' in loc:
                             logger.info(f"    ✅ Location validation passed: {json.dumps(loc)}")
@@ -485,10 +501,10 @@ class CheckoutService:
                             logger.error(f"    ❌ Location validation failed: missing required fields")
             else:
                 logger.warning(f"[CheckoutService] No provider locations found in cart_provider: {cart_provider}")
-            
-            logger.debug(f"[CheckoutService] Context created: {_safe_json(context)}")
-            logger.debug(f"[CheckoutService] Full SELECT request payload: {str(_safe_json(select_data))}")
-            
+
+            logger.debug(f"[CheckoutService] Full SELECT request payload:\n{json.dumps(select_data, indent=2)}")
+
+
             # GUEST MODE: SELECT API call without authentication
             auth_token = getattr(session, 'auth_token', None)
             if not auth_token:
@@ -497,14 +513,14 @@ class CheckoutService:
                 auth_token = None
             else:
                 logger.info("[CheckoutService] Using auth token for SELECT request")
-            
+
             # Call BIAP SELECT API (works with or without auth token for guest)
             # FIXED: Remove double array wrapping - buyer_backend_client will wrap correctly
             select_response = await self.buyer_app.select_items(select_data, auth_token=auth_token)
-            
+
             logger.info(f"[CheckoutService] SELECT API initial response received")
             logger.debug(f"[CheckoutService] SELECT initial response: {json.dumps(select_response, indent=2) if select_response else 'None'}")
-            
+
             # Extract message ID from response for polling
             # FIXED: For array responses, extract messageId from first item's context
             # Matches frontend pattern: data?.map((txn) => txn.context?.message_id)
@@ -524,7 +540,7 @@ class CheckoutService:
                     if isinstance(context, dict):
                         message_id = context.get('message_id')
                         logger.info(f"[CheckoutService] Extracted messageId from dict response: {message_id}")
-                        
+
             # Log response structure for debugging if no messageId found
             if not message_id:
                 logger.error(f"[CheckoutService] No messageId found in response structure:")
@@ -537,16 +553,16 @@ class CheckoutService:
                             logger.error(f"  First item keys: {list(select_response[0].keys())}")
                 elif isinstance(select_response, dict):
                     logger.error(f"  Dict keys: {list(select_response.keys())}")
-            
+
             if not message_id:
                 logger.error(f"[CheckoutService] No messageId in SELECT response: {select_response}")
                 return {
                     'success': False,
                     'message': ' Failed to initiate SELECT request. No message ID received.'
                 }
-            
+
             logger.info(f"[CheckoutService] Polling for SELECT response with messageId: {message_id}")
-            
+
             # Poll for the actual SELECT response
             result = await self._poll_for_response(
                 poll_function=self.buyer_app.get_select_response,
@@ -556,9 +572,9 @@ class CheckoutService:
                 initial_delay=2.0,
                 auth_token=auth_token
             )
-            
+
             logger.debug(f"[CheckoutService] Final SELECT response after polling: {json.dumps(result, indent=2) if result else 'None'}")
-            
+
             # FIXED: Handle ONDC response structure properly - error: null indicates success
             if result and (result.get('error') is None or result.get('error') == "null"):
                 # Update session to SELECT stage
@@ -569,9 +585,9 @@ class CheckoutService:
                     'pincode': delivery_pincode,
                     'items_count': len(session.cart.items)
                 })
-                
+
                 logger.info("[CheckoutService]  SELECT successful - delivery quotes received")
-                
+
                 # Smart next_step based on address source
                 if address_auto_fetched:
                     next_step = 'ready_for_initialize_order'
@@ -581,7 +597,7 @@ class CheckoutService:
                     next_step = 'provide_complete_delivery_details'
                     message = f' Delivery available in {delivery_city}! Please provide your complete delivery details to proceed.'
                     logger.info(f"[CheckoutService] MANUAL-ADDRESS: Need complete delivery details")
-                
+
                 return {
                     'success': True,
                     'message': message,
@@ -597,14 +613,13 @@ class CheckoutService:
                     'success': False,
                     'message': f' {error_msg}'
                 }
-                
+
         except Exception as e:
             logger.error(f"[CheckoutService] SELECT operation failed with exception: {e}", exc_info=True)
             return {
                 'success': False,
                 'message': ' Failed to get delivery options. Please try again.'
             }
-    
     async def initialize_order(
         self,
         session: Session,
@@ -898,7 +913,7 @@ class CheckoutService:
             },
             'deviceId': getattr(session, 'device_id', config.guest.device_id)
         }
-        return [_compact_dict(init_payload)]
+        return [init_payload]
     
     async def create_payment(self, session: Session, payment_method: str = 'razorpay', amount: Optional[float] = None) -> Dict[str, Any]:
         """
@@ -1414,17 +1429,3 @@ def get_checkout_service() -> CheckoutService:
     if _checkout_service is None:
         _checkout_service = CheckoutService()
     return _checkout_service
-def _safe_json(data, max_length=4000):
-    try:
-        s = json.dumps(data, ensure_ascii=False, default=str)
-        return s[:max_length] + (' ...[truncated]' if len(s) > max_length else '')
-    except Exception as e:
-        return f"<unserializable: {e}>"
-
-def _compact_dict(d):
-    """Recursively remove None, empty dicts/lists/strings."""
-    if isinstance(d, dict):
-        return {k: _compact_dict(v) for k, v in d.items() if v not in (None, {}, [], '')}
-    elif isinstance(d, list):
-        return [_compact_dict(v) for v in d if v not in (None, {}, [], '')]
-    return d
