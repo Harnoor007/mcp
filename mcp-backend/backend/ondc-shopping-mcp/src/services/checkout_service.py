@@ -431,24 +431,6 @@ class CheckoutService:
                 'userId': session.session_id,
                 'deviceId': getattr(session, 'device_id', config.guest.device_id)
             }
-            
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
             logger.info("[CheckoutService] Step 9: Calling BIAP SELECT API...")
             # Enhanced debug logging for SELECT request
